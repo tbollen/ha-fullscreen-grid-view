@@ -1,6 +1,15 @@
+const reportedConditionErrors = new Set();
+
 export function positive(value, fallback) {
   const number = Math.floor(Number(value));
   return Number.isFinite(number) && number > 0 ? number : fallback;
+}
+
+function allocationOrder(value) {
+  if (value === undefined || value === null || value === "") return 0;
+
+  const number = Math.floor(Number(value));
+  return Number.isFinite(number) ? number : 0;
 }
 
 export function conditionMatches(
@@ -36,6 +45,15 @@ export function conditionMatches(
     },
   });
 
+  const trackedHass = new Proxy(hass ?? {}, {
+    get(target, property, receiver) {
+      if (property === "states") return states;
+
+      dependencies?.add("*");
+      return Reflect.get(target, property, receiver);
+    },
+  });
+
   const viewCondition = config?.view_layout?.condition;
 
   if (
@@ -50,13 +68,17 @@ export function conditionMatches(
           "states",
           "global",
           `"use strict"; ${String(viewCondition).trim()}`,
-        )(hass, states, globals),
+        )(trackedHass, states, globals),
       );
     } catch (err) {
-      console.warn(
-        "[fullscreen-grid-view] Invalid view_layout.condition:",
-        err,
-      );
+      const conditionText = String(viewCondition).trim();
+      if (!reportedConditionErrors.has(conditionText)) {
+        reportedConditionErrors.add(conditionText);
+        console.warn(
+          "[fullscreen-grid-view] Invalid view_layout.condition:",
+          err,
+        );
+      }
       return false;
     }
   }
@@ -191,34 +213,38 @@ export function allocate(
       .map(stripDimensions);
   }
 
-  // Keep only cards that fit when every card uses its minimum dimensions.
-  let placements = placeCards(cards, false);
-  const placedIndices = new Set(placements.map(({ index }) => index));
+  // Select visible cards by priority, then keep their original placement order.
+  const priorityCards = [...cards].sort((a, b) => {
+    const orderDifference =
+      allocationOrder(a.config.view_layout?.order) -
+      allocationOrder(b.config.view_layout?.order);
 
-  const allocatableCards = cards.filter((card) =>
-    placedIndices.has(card.index),
-  );
+    return orderDifference || a.index - b.index;
+  });
+  let allocatableCards = [];
+
+  for (const card of priorityCards) {
+    const trialCards = [...allocatableCards, card].sort(
+      (a, b) => a.index - b.index,
+    );
+
+    if (placeCards(trialCards, false).length === trialCards.length) {
+      allocatableCards = trialCards;
+    }
+  }
+
+  const placements = placeCards(allocatableCards, false);
 
   const cardByIndex = new Map(
     allocatableCards.map((card) => [card.index, card]),
   );
 
   const sizingOrder = [...allocatableCards].sort((a, b) => {
-    const aRaw = a.config.view_layout?.order;
-    const bRaw = b.config.view_layout?.order;
+    const orderDifference =
+      allocationOrder(a.config.view_layout?.order) -
+      allocationOrder(b.config.view_layout?.order);
 
-    const aOrder = Number(aRaw);
-    const bOrder = Number(bRaw);
-
-    const aValid = aRaw != null && aRaw !== "" && Number.isFinite(aOrder);
-
-    const bValid = bRaw != null && bRaw !== "" && Number.isFinite(bOrder);
-
-    if (aValid && bValid) return aOrder - bOrder;
-    if (aValid) return -1;
-    if (bValid) return 1;
-
-    return a.index - b.index;
+    return orderDifference || a.index - b.index;
   });
 
   let occupiedCells = allocatableCards.reduce(
@@ -297,22 +323,6 @@ export function allocate(
 
     if (availableCells <= 0) break;
   }
-
-  // LOG PLACEMENTS TO THE CONSOLE
-  console.group("fullscreen-grid-view");
-  console.info("Fullscreen grid view placements");
-  console.table(
-    placeCards(allocatableCards, false).map((p) => ({
-      index: p.index,
-      row: p.row,
-      col: p.col,
-      width: p.width,
-      height: p.height,
-      columns,
-      rows,
-    })),
-  );
-  console.groupEnd();
 
   return placeCards(allocatableCards, false).map(stripDimensions);
 

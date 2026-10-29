@@ -23,6 +23,8 @@ class FullscreenGridView extends HTMLElement {
     this._lovelace = undefined;
     this._editMode = false;
     this._cards = [];
+    this._renderedCards = new Map();
+    this._allocationSignatures = new Map();
 
     this._conditionRecords = new Map();
     this._globalRecords = new Map();
@@ -50,45 +52,95 @@ class FullscreenGridView extends HTMLElement {
 
   set hass(hass) {
     const previousHass = this._hass;
-
-    const records = [
+    const previousDependencies = [
       ...this._conditionRecords.values(),
       ...this._globalRecords.values(),
     ];
+    const changedDependencies = new Set();
 
-    const dependenciesChanged = records.some(({ dependencies }) => {
+    for (const { dependencies } of previousDependencies) {
       if (dependencies.has("*")) {
-        return previousHass !== hass;
+        if (previousHass !== hass) changedDependencies.add("*");
+        continue;
       }
 
       for (const entityId of dependencies) {
         if (previousHass?.states?.[entityId] !== hass?.states?.[entityId]) {
-          return true;
+          changedDependencies.add(entityId);
         }
       }
-
-      return false;
-    });
+    }
 
     this._hass = hass;
 
-    for (const card of this._cards) {
-      if (card) card.hass = hass;
+    if (!changedDependencies.size) {
+      this._forwardHassToCards(hass);
+      return;
     }
 
-    if (dependenciesChanged) {
-      this._render();
+    const previousConditions = this._conditionRecords;
+    const previousAllocationSignatures = this._allocationSignatures;
+    const evaluation = this._evaluateCards();
+
+    const visibilityChanged = this._conditionResultsChanged(
+      previousConditions,
+      evaluation.conditionRecords,
+    );
+    const allocationChanged = this._signaturesChanged(
+      previousAllocationSignatures,
+      evaluation.allocationSignatures,
+    );
+
+    if (visibilityChanged || allocationChanged) {
+      this._render(evaluation);
+      return;
     }
+
+    this._updateCardConfigurations(evaluation);
+    this._forwardHassToCards(hass);
+  }
+
+  _forwardHassToCards(hass) {
+    for (const record of this._renderedCards.values()) {
+      try {
+        record.card.hass = hass;
+      } catch {
+        this._replaceCardWithError(record);
+      }
+    }
+
+    this._cards = [...this._renderedCards.values()].map(({ card }) => card);
   }
 
   get hass() {
     return this._hass;
   }
 
+  // OLD LOVELACE
+  // set lovelace(lovelace) {
+  //   this._lovelace = lovelace;
+  //   this._editMode = Boolean(lovelace?.editMode);
+  //   this._render();
+  // }
   set lovelace(lovelace) {
+    const previousEditMode = this._editMode;
+
     this._lovelace = lovelace;
     this._editMode = Boolean(lovelace?.editMode);
-    this._render();
+
+    for (const record of this._renderedCards.values()) {
+      try {
+        record.card.lovelace = lovelace;
+      } catch {
+        this._replaceCardWithError(record);
+      }
+    }
+
+    this._cards = [...this._renderedCards.values()].map(({ card }) => card);
+
+    if (previousEditMode !== this._editMode) {
+      this._render();
+    }
   }
 
   get lovelace() {
@@ -442,6 +494,7 @@ class FullscreenGridView extends HTMLElement {
             return trackedStates;
           }
 
+          dependencies.add("*");
           return Reflect.get(target, property, receiver);
         },
       });
@@ -469,7 +522,113 @@ class FullscreenGridView extends HTMLElement {
     this._globals = globals;
   }
 
-  _render() {
+  _evaluateCards() {
+    this._evaluateGlobals();
+
+    const source = Array.isArray(this._config.cards) ? this._config.cards : [];
+    const allEntries = source
+      .map((config, index) => ({
+        config: this._resolveGlobals(structuredClone(config)),
+        index,
+      }))
+      .filter(({ config }) => Boolean(config?.type));
+
+    const staticEntries = allEntries.filter(
+      ({ config }) => config.view_layout?.static === true,
+    );
+    const candidates = allEntries.filter(
+      ({ config }) => config.view_layout?.static !== true,
+    );
+    const conditionRecords = new Map();
+
+    const entries = candidates.map(({ config, index }) => {
+      const dependencies = new Set();
+      const conditionVisible = conditionMatches(
+        this._hass,
+        config,
+        dependencies,
+        this._globals ?? {},
+      );
+
+      conditionRecords.set(index, {
+        dependencies,
+        visible: conditionVisible,
+      });
+
+      return { config, index, conditionVisible };
+    });
+
+    this._conditionRecords = conditionRecords;
+
+    const allocationSignatures = new Map(
+      candidates.map(({ config, index }) => [
+        index,
+        JSON.stringify({
+          hidden: config.hidden,
+          static: config.view_layout?.static,
+          order: config.view_layout?.order,
+          width: config.view_layout?.width,
+          height: config.view_layout?.height,
+          min_width: config.view_layout?.min_width,
+          max_width: config.view_layout?.max_width,
+          min_height: config.view_layout?.min_height,
+          max_height: config.view_layout?.max_height,
+        }),
+      ]),
+    );
+
+    return {
+      entries,
+      staticEntries,
+      conditionRecords,
+      allocationSignatures,
+      resolvedConfigs: new Map(
+        allEntries.map(({ config, index }) => [
+          index,
+          { config, signature: JSON.stringify(config) },
+        ]),
+      ),
+    };
+  }
+
+  _conditionResultsChanged(previous, next) {
+    if (previous.size !== next.size) return true;
+
+    for (const [index, record] of next) {
+      if (previous.get(index)?.visible !== record.visible) return true;
+    }
+
+    return false;
+  }
+
+  _signaturesChanged(previous, next) {
+    if (previous.size !== next.size) return true;
+
+    for (const [index, signature] of next) {
+      if (previous.get(index) !== signature) return true;
+    }
+
+    return false;
+  }
+
+  _updateCardConfigurations(evaluation) {
+    for (const [index, record] of this._renderedCards) {
+      const resolved = evaluation.resolvedConfigs.get(index);
+      if (!resolved || record.signature === resolved.signature) continue;
+
+      const card = this._createCard(resolved.config);
+      if (record.card.parentElement) {
+        record.card.parentElement.replaceChild(card, record.card);
+      }
+      record.card = card;
+      record.config = resolved.config;
+      record.signature = resolved.signature;
+    }
+
+    this._cards = [...this._renderedCards.values()].map(({ card }) => card);
+  }
+
+  _render(evaluation = null) {
     if (!this._grid || !this._config) return;
 
     const settings = this._getLayoutSettings();
@@ -480,11 +639,7 @@ class FullscreenGridView extends HTMLElement {
       return;
     }
 
-    this._evaluateGlobals();
-    this._grid.replaceChildren();
-    this._staticList.replaceChildren();
-    this._runtimeStatic.replaceChildren();
-    this._cards = [];
+    evaluation ??= this._evaluateCards();
 
     const { layout, defaults } = settings;
     const columns = settings.fixed
@@ -536,62 +691,11 @@ class FullscreenGridView extends HTMLElement {
     this._addCardSection.classList.toggle("visible", this._editMode);
     this._staticEditor.classList.toggle("visible", this._editMode);
 
-    const source = Array.isArray(this._config.cards) ? this._config.cards : [];
-
-    const allEntries = source
-      .map((config, index) => ({ config, index }))
-      .filter(({ config }) => Boolean(config?.type));
-
-    const staticEntries = allEntries.filter(
-      ({ config }) => config.view_layout?.static === true,
+    const entries = evaluation.entries.filter(
+      ({ conditionVisible }) => this._editMode || conditionVisible,
     );
 
-    const candidates = allEntries.filter(
-      ({ config }) => config.view_layout?.static !== true,
-    );
-
-    // Evaluate each condition once and rebuild its dependency index.
-    this._conditionRecords.clear();
-
-    const entries = candidates
-      .map(({ config, index }) => {
-        const dependencies = new Set();
-
-        const conditionVisible = conditionMatches(
-          this._hass,
-          config,
-          dependencies,
-          this._globals ?? {},
-        );
-
-        this._conditionRecords.set(index, {
-          dependencies,
-          visible: conditionVisible,
-        });
-
-        return {
-          config,
-          index,
-          conditionVisible,
-        };
-      })
-      .filter(({ conditionVisible }) => this._editMode || conditionVisible)
-      .sort((a, b) => {
-        const orderA = positive(a.config.view_layout?.order, a.index + 1);
-        const orderB = positive(b.config.view_layout?.order, b.index + 1);
-        return orderA - orderB || a.index - b.index;
-      });
-
-    // DEBUG HERE!!!
-    console.log(
-      "Cards entering allocation:",
-      candidates.map(({ config, index }) => ({
-        index,
-        type: config.type,
-        entity: config.entity,
-        view_layout: config.view_layout,
-      })),
-    );
+    const { staticEntries } = evaluation;
     const placements = allocate(
       entries,
       columns,
@@ -606,84 +710,181 @@ class FullscreenGridView extends HTMLElement {
       ? placements
       : placements.filter((placement) => !placement.outOfBounds);
 
-    if (!shownPlacements.length && this._editMode) {
-      this._grid.append(this._empty("No grid cards configured."));
-    }
+    this._allocationSignatures = evaluation.allocationSignatures;
+    this._reconcile(shownPlacements, evaluation);
+  }
 
-    for (const placement of shownPlacements) {
-      const cell = document.createElement("div");
+  _reconcile(placements, evaluation) {
+    const desired = new Set();
+    const entriesByIndex = new Map(
+      evaluation.entries.map((entry) => [entry.index, entry]),
+    );
 
+    this._grid.querySelector(":scope > .empty")?.remove();
+    this._staticList.querySelector(":scope > .empty")?.remove();
+
+    const getRecord = (index, kind, config) => {
+      const resolved = evaluation.resolvedConfigs.get(index);
+      let record = this._renderedCards.get(index);
+
+      if (!record) {
+        record = {
+          index,
+          kind,
+          card: this._createCard(config),
+          config,
+          signature: resolved?.signature,
+          cell: null,
+        };
+        this._renderedCards.set(index, record);
+      } else {
+        if (record.signature !== resolved?.signature) {
+          const card = this._createCard(config);
+          if (record.card.parentElement) {
+            record.card.parentElement.replaceChild(card, record.card);
+          }
+          record.card = card;
+          record.config = config;
+          record.signature = resolved?.signature;
+        }
+
+        if (record.kind !== kind) {
+          record.cell?.remove();
+          record.cell = null;
+          record.kind = kind;
+        }
+      }
+
+      return record;
+    };
+
+    for (const placement of placements) {
+      const entry = entriesByIndex.get(placement.index);
+      if (!entry) continue;
+
+      desired.add(placement.index);
+      const record = getRecord(placement.index, "grid", entry.config);
+      const cell = record.cell ?? document.createElement("div");
+      record.cell = cell;
       cell.className = [
         "card-cell",
         ...(this._editMode ? ["editable"] : []),
         ...(placement.outOfBounds ? ["out-of-bounds"] : []),
         ...(placement.conditionVisible === false ? ["condition-hidden"] : []),
       ].join(" ");
+      cell.style.gridColumn = `${placement.col + 1} / span ${placement.width}`;
+      cell.style.gridRow = `${placement.row + 1} / span ${placement.height}`;
 
-      cell.style.gridColumn = `span ${placement.width}`;
-      cell.style.gridRow = `span ${placement.height}`;
-
-      const card = this._createCard(placement.config);
-      if (!card) continue;
-
-      cell.append(card);
-
-      if (this._editMode) {
-        addCardControls(this, cell, placement.index);
-      }
-
-      this._grid.append(cell);
-      this._cards.push(card);
+      if (record.card.parentElement !== cell) cell.append(record.card);
+      this._syncCardControls(cell, placement.index);
+      if (cell.parentElement !== this._grid) this._grid.append(cell);
     }
 
-    for (const entry of staticEntries) {
-      const card = this._createCard(entry.config);
-      if (!card) continue;
+    if (!placements.length && this._editMode) {
+      this._grid.append(this._empty("No grid cards configured."));
+    }
 
-      this._cards.push(card);
+    for (const entry of evaluation.staticEntries) {
+      desired.add(entry.index);
+      const record = getRecord(entry.index, "static", entry.config);
 
       if (this._editMode) {
-        const cell = document.createElement("div");
+        const cell = record.cell ?? document.createElement("div");
+        record.cell = cell;
         cell.className = "static-cell";
 
-        const label = document.createElement("div");
-        label.className = "static-label";
+        let label = cell.querySelector(".static-label");
+        if (!label) {
+          label = document.createElement("div");
+          label.className = "static-label";
+          cell.prepend(label);
+        }
         label.textContent =
           entry.config.title ||
           entry.config.name ||
           entry.config.type ||
           `Static card ${entry.index + 1}`;
 
-        cell.append(label, card);
-        addCardControls(this, cell, entry.index);
+        if (record.card.parentElement !== cell) cell.append(record.card);
+        this._syncCardControls(cell, entry.index);
         this._staticList.append(cell);
       } else {
-        this._runtimeStatic.append(card);
+        record.cell?.remove();
+        record.cell = null;
+        this._runtimeStatic.append(record.card);
       }
     }
 
-    if (this._editMode && !staticEntries.length) {
+    if (this._editMode && !evaluation.staticEntries.length) {
       this._staticList.append(this._empty("No static cards configured."));
     }
 
-    if (this._hass) {
-      for (const card of this._cards) {
-        card.hass = this._hass;
+    for (const [index, record] of this._renderedCards) {
+      if (desired.has(index)) continue;
+      record.cell?.remove();
+      record.card.remove();
+      this._renderedCards.delete(index);
+    }
+
+    this._cards = [...this._renderedCards.values()].map(({ card }) => card);
+    for (const record of this._renderedCards.values()) {
+      if (this._hass) {
+        try {
+          record.card.hass = this._hass;
+        } catch {
+          this._replaceCardWithError(record);
+        }
       }
+      if (this._lovelace) {
+        try {
+          record.card.lovelace = this._lovelace;
+        } catch {
+          this._replaceCardWithError(record);
+        }
+      }
+    }
+
+    this._cards = [...this._renderedCards.values()].map(({ card }) => card);
+  }
+
+  _syncCardControls(cell, index) {
+    const controls = cell.querySelector(":scope > .card-overlay");
+
+    if (this._editMode && !controls) {
+      addCardControls(this, cell, index);
+    } else if (!this._editMode && controls) {
+      controls.remove();
     }
   }
 
   _createCard(config) {
-    const resolvedConfig = this._resolveGlobals(structuredClone(config));
+    try {
+      const card = document.createElement("hui-card");
+      card.setAttribute("type", config.type);
+      card.config = config;
 
-    const card = document.createElement("hui-card");
-    card.setAttribute("type", resolvedConfig.type);
-    card.config = resolvedConfig;
+      if (this._hass) card.hass = this._hass;
+      if (this._lovelace) card.lovelace = this._lovelace;
+      return card;
+    } catch {
+      return this._createCardError();
+    }
+  }
 
-    if (this._hass) card.hass = this._hass;
-    if (this._lovelace) card.lovelace = this._lovelace;
+  _createCardError() {
+    const fallback = document.createElement("div");
+    fallback.className = "card-error";
+    fallback.setAttribute("role", "alert");
+    fallback.textContent = "Unable to display this card.";
+    return fallback;
+  }
 
-    return card;
+  _replaceCardWithError(record) {
+    const fallback = this._createCardError();
+    if (record.card.parentElement) {
+      record.card.parentElement.replaceChild(fallback, record.card);
+    }
+    record.card = fallback;
   }
 
   _empty(message) {
@@ -804,8 +1005,7 @@ class FullscreenGridView extends HTMLElement {
           key: "order",
           value: layout.order ?? "",
           type: "number",
-          min: 1,
-          hint: "Optional sizing priority. Leave blank for default priority.",
+          hint: "Priority to stay visible and grow into free space. Lower values go first; omitted order is 0. Placement stays in card order.",
         },
         {
           label: "Width",
@@ -886,7 +1086,7 @@ class FullscreenGridView extends HTMLElement {
           if (raw !== "" && raw !== undefined && raw !== null) {
             const number = Math.floor(Number(raw));
 
-            if (Number.isFinite(number) && number > 0) {
+            if (Number.isFinite(number) && (key === "order" || number > 0)) {
               nextLayout[key] = number;
             }
           }
